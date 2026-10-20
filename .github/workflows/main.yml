@@ -1,17 +1,10 @@
-name: ZooPLAY App Analysis (REA)
+name: REA Full APK Analysis
 
 on:
   workflow_dispatch:
     inputs:
-      target_type:
-        description: "What are you analyzing?"
-        required: true
-        type: choice
-        options:
-          - apk
-          - javascript-repository
-      target_url:
-        description: "Direct APK download URL or Git repository URL (public URL)"
+      apk_url:
+        description: "Direct HTTPS download URL of the APK (not a Play Store page)"
         required: true
         type: string
 
@@ -19,13 +12,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: rea-analysis-${{ github.run_id }}
+  group: rea-apk-analysis
   cancel-in-progress: false
 
 jobs:
-  analyze:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  analyze-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
     steps:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
@@ -35,114 +29,133 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Set up Java for APK analysis
-        if: inputs.target_type == 'apk'
+      - name: Set up Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
 
+      - name: Install system prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y procps python3 unzip curl
+
       - name: Install REA
         run: npm install --global rea-agents@latest
 
-      - name: Download and verify JADX bridge for APK analysis
-        if: inputs.target_type == 'apk'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/rea"
-          curl --fail --location --silent --show-error \
-            --max-time 120 \
-            --output "$RUNNER_TEMP/rea/jadx-headless-mcp-0.7.1-all.jar" \
-            "https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.1/jadx-headless-mcp-0.7.1-all.jar"
-          echo "6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75  $RUNNER_TEMP/rea/jadx-headless-mcp-0.7.1-all.jar" | sha256sum --check
-          echo "REA_JADX_MCP_JAR=$RUNNER_TEMP/rea/jadx-headless-mcp-0.7.1-all.jar" >> "$GITHUB_ENV"
-
-      - name: Download APK target
-        if: inputs.target_type == 'apk'
-        shell: bash
+      - name: Download pinned JADX bridge
         env:
-          TARGET_URL: ${{ inputs.target_url }}
+          JAR_URL: https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.1/jadx-headless-mcp-0.7.1-all.jar
+          JAR_SHA256: 6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75
         run: |
-          set -euo pipefail
-          mkdir -p artifacts/input reports
-          # Only download an APK from a URL you trust and are authorized to analyze.
-          curl --fail --location --silent --show-error \
-            --max-time 180 --max-filesize 800000000 \
-            "$TARGET_URL" -o artifacts/input/target.apk
-          file artifacts/input/target.apk
-          sha256sum artifacts/input/target.apk | tee reports/apk-sha256.txt
-          # Basic ZIP signature check; JADX will validate deeper structure.
-          python - <<'PY'
-          from pathlib import Path
-          p = Path("artifacts/input/target.apk")
-          with p.open("rb") as f:
-              sig = f.read(4)
-          if sig[:2] != b"PK":
-              raise SystemExit("Downloaded file does not look like an APK/ZIP archive.")
-          PY
+          mkdir -p tools input reports
+          curl --fail --location --retry 3 "$JAR_URL" -o tools/jadx-headless-mcp-0.7.1-all.jar
+          echo "$JAR_SHA256  tools/jadx-headless-mcp-0.7.1-all.jar" | sha256sum --check
+          echo "REA_JADX_MCP_JAR=$GITHUB_WORKSPACE/tools/jadx-headless-mcp-0.7.1-all.jar" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
 
-      - name: Analyze APK with REA
-        if: inputs.target_type == 'apk'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p reports
-          rea inspect-android-package "$GITHUB_WORKSPACE/artifacts/input/target.apk" --json \
-            > reports/apk-analysis.json
-
-      - name: Clone JavaScript/Electron repository
-        if: inputs.target_type == 'javascript-repository'
-        shell: bash
+      - name: Download and validate target APK
         env:
-          TARGET_URL: ${{ inputs.target_url }}
+          APK_URL: ${{ inputs.apk_url }}
         run: |
           set -euo pipefail
-          mkdir -p artifacts reports
-          # Do not execute the target repository's install scripts or app code.
-          git clone --depth 1 --no-recurse-submodules "$TARGET_URL" artifacts/target-source
-          git -C artifacts/target-source rev-parse HEAD | tee reports/source-commit.txt
-          find artifacts/target-source -maxdepth 3 -type f \
-            \( -name 'package.json' -o -name 'electron-builder.yml' -o -name 'vite.config.*' \
-               -o -name 'webpack.config.*' -o -name 'README*' \) \
-            -print > reports/project-files.txt
+          curl --fail --location --retry 3 --max-time 600 "$APK_URL" -o input/target.apk
+          test -s input/target.apk
+          # APKs are ZIP containers; verify the archive can be listed and has a manifest.
+          unzip -t input/target.apk
+          unzip -Z1 input/target.apk | grep -Fx 'AndroidManifest.xml'
+          sha256sum input/target.apk | tee reports/apk-sha256.txt
+          ls -lh input/target.apk | tee reports/apk-size.txt
 
-      - name: Analyze JavaScript/Electron repository with REA
-        if: inputs.target_type == 'javascript-repository'
+      - name: Record tool versions
+        continue-on-error: true
+        run: |
+          {
+            echo "## Tool versions"
+            node --version
+            npm --version
+            java -version 2>&1
+            rea --help 2>&1
+          } > reports/tool-versions.txt
+
+      - name: REA package and manifest analysis
+        continue-on-error: true
+        run: |
+          rea inspect-android-package "$GITHUB_WORKSPACE/input/target.apk" --json \
+            > reports/01-package-manifest.json 2> reports/01-package-manifest.stderr.txt
+
+      - name: REA complete class-name inventory
+        continue-on-error: true
+        run: |
+          # An empty query asks REA for the full reported class-name inventory.
+          rea search-android-classes "$GITHUB_WORKSPACE/input/target.apk" "" --json \
+            > reports/02-all-classes.json 2> reports/02-all-classes.stderr.txt
+
+      - name: REA targeted class searches
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
-          rea analyze-javascript-application "$GITHUB_WORKSPACE/artifacts/target-source" --json \
-            > reports/javascript-analysis.json
+          apk="$GITHUB_WORKSPACE/input/target.apk"
+          search_one() {
+            label="$1"
+            query="$2"
+            rea search-android-classes "$apk" "$query" --json \
+              > "reports/03-classes-${label}.json" \
+              2> "reports/03-classes-${label}.stderr.txt" || true
+          }
+          search_one activities Activity
+          search_one fragments Fragment
+          search_one services Service
+          search_one receivers Receiver
+          search_one viewmodels ViewModel
+          search_one networking Retrofit
+          search_one okhttp OkHttp
+          search_one webview WebView
+          search_one media Media3
+          search_one exoplayer ExoPlayer
+          search_one players Player
+          search_one database Database
+          search_one preferences SharedPreferences
+          search_one firebase Firebase
+          search_one billing Billing
+          search_one auth Auth
+          search_one json Gson
+          search_one serialization Serializer
 
-      - name: Write analysis notes
+      - name: Create analysis index and evidence checklist
         if: always()
-        shell: bash
         run: |
-          mkdir -p reports
           cat > reports/README.md <<'EOF'
-          # REA static analysis output
+          # REA APK analysis bundle
 
-          This artifact contains static analysis evidence produced by REA. It is not a guarantee
-          that every feature, backend behavior, or runtime path has been recovered.
+          ## Included analysis
+          - `01-package-manifest.json`: package metadata, manifest declarations, permissions, SDK information and class/resource counts reported by REA.
+          - `02-all-classes.json`: complete class-name inventory as reported by REA, if supported by the installed version.
+          - `03-classes-*.json`: targeted class searches for common UI, networking, media, storage and service patterns.
+          - `*.stderr.txt`: command diagnostics for failed or unsupported operations.
+          - `apk-sha256.txt`: SHA-256 fingerprint of the exact input APK.
+          - `tool-versions.txt`: runtime/tool information.
 
-          - APK: package/manifest and decompiler evidence. APK authenticity/signature verification
-            and runtime behavior are not established by this workflow.
-          - JavaScript/Electron: module/import evidence from the supplied source directory.
-          - Unknowns: backend-only behavior, secrets not present in the artifact, dynamic/reflection
-            behavior, and runtime-only states may require separate authorized investigation.
+          ## Important limits
+          REA's Android analysis is static. It does not run the APK, prove runtime network calls, verify the APK's signature/authenticity, fully decode every resource table, or recover private backend source code. A class-name search is a lead, not proof that a feature is active. Decompilation may be incomplete or obfuscated.
 
-          Review the JSON as untrusted data. Do not publish tokens, private URLs, personal data,
-          or proprietary source without permission.
+          ## How to continue
+          Use the class inventory to select important classes, then run the documented REA commands `inspect-android-class`, `inspect-android-method`, and `trace-android-references` for specific class/method names. Those commands need exact selectors; this workflow avoids guessing a class or method name.
           EOF
+          {
+            echo "# REA APK workflow result"
+            echo
+            echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            echo "## Reports"
+            find reports -maxdepth 1 -type f -printf '%f\n' | sort
+          } > reports/INDEX.md
 
-      - name: Upload reports
+      - name: Upload analysis reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rea-analysis-${{ github.run_number }}
-          path: |
-            reports/
-            artifacts/input/target.apk
+          name: rea-full-apk-analysis
+          path: reports/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 14
